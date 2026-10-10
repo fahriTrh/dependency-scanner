@@ -1,0 +1,243 @@
+name: Dependency Security Scan (reusable)
+
+# Reusable workflow — dipanggil dari repo mana pun, contoh:
+#
+#   jobs:
+#     scan:
+#       uses: OWNER/dependency-scanner/.github/workflows/dependency-scan.yml@main
+#       permissions:
+#         contents: read
+#         security-events: write   # WAJIB agar SARIF bisa di-upload ke Code Scanning
+#       with:
+#         scanner-url: https://scanner-anda.example.com   # mode deployed (default)
+#         upload-sarif: true                              # hasil tampil di tab Security → Code scanning
+#         # atau mode: local + scanner-repo: OWNER/dependency-scanner
+#         #   (scanner dinyalakan di runner; repo scanner harus publik,
+#         #    atau sediakan PAT via secret `token` jika privat)
+#       secrets:
+#         api-key: ${{ secrets.SCAN_API_KEY }}
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "deployed = pakai scanner-url; local = nyalakan scanner di runner"
+        required: false
+        type: string
+        default: deployed
+      scanner-url:
+        description: "URL dasar scanner (mode deployed), mis. https://scanner.example.com"
+        required: false
+        type: string
+        default: ""
+      scanner-repo:
+        description: "Repo scanner untuk mode local, mis. OWNER/dependency-scanner. WAJIB diisi jika workflow dipanggil dari repo lain (github.repository merujuk repo pemanggil, bukan repo scanner)"
+        required: false
+        type: string
+        default: ""
+      repo:
+        description: "Repo yang discan, default repo pemanggil (owner/name)"
+        required: false
+        type: string
+        default: ""
+      branch:
+        description: "Branch yang discan (kosong = default branch)"
+        required: false
+        type: string
+        default: ""
+      path:
+        description: "Subdirektori dalam repo yang berisi composer.json/package.json"
+        required: false
+        type: string
+        default: ""
+      fail-on:
+        description: "Gagalkan build jika risk >= nilai ini: none | aman | tinggi | kritis"
+        required: false
+        type: string
+        default: tinggi
+      upload-sarif:
+        description: "Upload hasil scan sebagai SARIF ke GitHub Code Scanning (butuh permissions security-events: write; repo private butuh GitHub Advanced Security)"
+        required: false
+        type: boolean
+        default: false
+      php-version:
+        description: "Versi PHP untuk mode local"
+        required: false
+        type: string
+        default: "8.3"
+    secrets:
+      api-key:
+        description: "SCAN_API_KEY scanner (kosongkan jika scanner tanpa proteksi)"
+        required: false
+
+permissions:
+  contents: read
+  # Dibutuhkan github/codeql-action/upload-sarif; repo pemanggil juga harus
+  # memberi izin ini pada job-nya (lihat contoh di atas).
+  security-events: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Tentukan repo target
+        id: target
+        run: |
+          if [ -n "${{ inputs.repo }}" ]; then
+            echo "repo=${{ inputs.repo }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "repo=${{ github.repository }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---------- MODE LOCAL: nyalakan scanner di runner ----------
+      - name: Checkout scanner
+        if: ${{ inputs.mode == 'local' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.scanner-repo != '' && inputs.scanner-repo || github.repository }}
+
+      - name: Setup PHP
+        if: ${{ inputs.mode == 'local' }}
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ inputs.php-version }}
+          extensions: dom, curl, json, mbstring
+          coverage: none
+
+      - name: Install & jalankan scanner
+        if: ${{ inputs.mode == 'local' }}
+        run: |
+          composer install --no-interaction --no-progress --prefer-dist --no-dev
+          cp .env.example .env
+          php artisan key:generate
+          php artisan serve --host=127.0.0.1 --port=8080 > server.log 2>&1 &
+          for i in $(seq 1 20); do
+            curl -fsS http://127.0.0.1:8080/up > /dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS http://127.0.0.1:8080/up > /dev/null
+          echo "SCANNER_URL=http://127.0.0.1:8080" >> "$GITHUB_ENV"
+
+      # ---------- MODE DEPLOYED ----------
+      - name: Set URL scanner deployed
+        if: ${{ inputs.mode == 'deployed' }}
+        run: |
+          if [ -z "${{ inputs.scanner-url }}" ]; then
+            echo "::error::mode=deployed butuh input 'scanner-url' (atau pakai mode: local)."
+            exit 1
+          fi
+          echo "SCANNER_URL=${{ inputs.scanner-url }}" >> "$GITHUB_ENV"
+
+      # ---------- SCAN ----------
+      - name: Jalankan scan
+        id: scan
+        env:
+          API_KEY: ${{ secrets.api-key }}
+          TARGET_REPO: ${{ steps.target.outputs.repo }}
+          BRANCH: ${{ inputs.branch }}
+          PATH_IN_REPO: ${{ inputs.path }}
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg repo "$TARGET_REPO" \
+            --arg branch "$BRANCH" \
+            --arg path "$PATH_IN_REPO" \
+            '{repo: $repo}
+             + (if $branch != "" then {branch: $branch} else {} end)
+             + (if $path   != "" then {path:   $path}   else {} end)')
+
+          AUTH_HEADER=()
+          if [ -n "$API_KEY" ]; then
+            AUTH_HEADER=(-H "Authorization: Bearer $API_KEY")
+          fi
+
+          # Simpan payload agar dipakai ulang oleh langkah SARIF
+          echo "$PAYLOAD" > scan-payload.json
+
+          curl -fsS -X POST "$SCANNER_URL/api/scan?format=markdown" \
+            -H "Content-Type: application/json" \
+            "${AUTH_HEADER[@]}" \
+            -d "$PAYLOAD" -o scan-report.md
+
+          cat scan-report.md
+
+          RISK=$(sed -n 's/.*<!-- scan-risk: \([a-z]*\) -->.*/\1/p' scan-report.md | tail -1)
+          echo "risk=$RISK" >> "$GITHUB_OUTPUT"
+
+      # ---------- SARIF (opsional, input upload-sarif) ----------
+      # Catatan: scan diulang di endpoint export sehingga request ke
+      # Packagist/npm juga berlipat — aktifkan hanya jika memang dipakai.
+      - name: Ambil laporan SARIF
+        id: sarif
+        if: ${{ inputs.upload-sarif }}
+        continue-on-error: true
+        env:
+          API_KEY: ${{ secrets.api-key }}
+        run: |
+          AUTH_HEADER=()
+          if [ -n "$API_KEY" ]; then
+            AUTH_HEADER=(-H "Authorization: Bearer $API_KEY")
+          fi
+
+          if ! curl -fsS -X POST "$SCANNER_URL/api/scan/export?format=sarif" \
+            -H "Content-Type: application/json" \
+            "${AUTH_HEADER[@]}" \
+            --data-binary @scan-payload.json -o scan.sarif; then
+            echo "::warning::Gagal mengunduh SARIF dari scanner (format=sarif mungkin belum tersedia di scanner versi ini)."
+            exit 1
+          fi
+
+          # Pastikan isinya dokumen SARIF, bukan halaman error
+          jq -e '.version == "2.1.0" and (.runs | type == "array")' scan.sarif > /dev/null
+
+      - name: Upload SARIF ke GitHub Code Scanning
+        id: sarif-upload
+        if: ${{ inputs.upload-sarif && hashFiles('scan.sarif') != '' }}
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          files: scan.sarif
+          category: dependency-scan
+
+      - name: Catat kegagalan upload SARIF
+        if: ${{ inputs.upload-sarif && steps.sarif-upload.outcome == 'failure' }}
+        run: |
+          echo "::warning::Upload SARIF gagal — pastikan job punya permissions 'security-events: write' dan (untuk repo private) GitHub Advanced Security aktif."
+
+      - name: Tulis ke GitHub Step Summary
+        if: always() && hashFiles('scan-report.md') != ''
+        run: cat scan-report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload laporan (artifact)
+        if: always() && hashFiles('scan-report.md') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-scan-report
+          path: scan-report.md
+
+      - name: Cek threshold
+        env:
+          RISK: ${{ steps.scan.outputs.risk }}
+          FAIL_ON: ${{ inputs.fail-on }}
+        run: |
+          # Urutan keparahan: none < aman < tinggi < kritis
+          case "$FAIL_ON" in
+            none)   LEVEL=0 ;;
+            aman)   LEVEL=1 ;;
+            tinggi) LEVEL=2 ;;
+            kritis) LEVEL=3 ;;
+            *)      echo "::error::fail-on tidak dikenal: $FAIL_ON"; exit 1 ;;
+          esac
+
+          case "$RISK" in
+            aman)   ACTUAL=1 ;;
+            tinggi) ACTUAL=2 ;;
+            kritis) ACTUAL=3 ;;
+            *)      ACTUAL=3 ;;   # risk tidak terbaca -> gagal aman (fail-safe)
+          esac
+
+          if [ "$ACTUAL" -ge "$LEVEL" ]; then
+            echo "::error::Scan dependency: risiko '$RISK' >= ambang '$FAIL_ON'. Lihat Step Summary."
+            exit 1
+          fi
+
+          echo "Risiko '$RISK' di bawah ambang '$FAIL_ON' — lolos."

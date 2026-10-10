@@ -1,0 +1,34 @@
+name: Dependency Security Scan
+
+# Contoh pemanggil reusable workflow. Di repo scanner sendiri, `uses:` relatif.
+# Dari repo lain, ganti menjadi:
+#   uses: OWNER/dependency-scanner/.github/workflows/dependency-scan.yml@main
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "0 3 * * *" # harian 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      fail-on:
+        description: "Gagalkan build jika risk >= nilai ini"
+        type: choice
+        options: [none, aman, tinggi, kritis]
+        default: tinggi
+
+permissions:
+  contents: read
+  security-events: write         # untuk upload SARIF ke Code Scanning
+
+jobs:
+  scan:
+    uses: ./.github/workflows/dependency-scan.yml
+    with:
+      mode: local                 # ganti "deployed" + scanner-url jika scanner sudah online
+      # scanner-url: https://scanner-anda.example.com
+      upload-sarif: true          # hasil scan tampil di tab Security → Code scanning
+      fail-on: ${{ github.event_name == 'schedule' && 'tinggi' || inputs.fail-on || 'tinggi' }}
+    secrets:
+      api-key: ${{ secrets.SCAN_API_KEY }}
