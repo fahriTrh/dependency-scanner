@@ -110,4 +110,97 @@ class NpmCheckerTest extends TestCase
         $this->assertStringContainsString('API tidak bisa dihubungi', $pkg['skip_reason']);
         $this->assertNotEmpty($result['warnings']);
     }
+
+    public function test_advisory_outside_dependency_range_is_rejected_by_intersection(): void
+    {
+        Http::fake([
+            'registry.npmjs.org/lodash' => Http::response([
+                'versions' => [
+                    '4.17.10' => [],
+                    '4.17.20' => [],
+                    '4.17.21' => [],
+                ],
+            ]),
+            // API tetap mengembalikan advisory karena semua versi registry
+            // dikirim (termasuk 4.17.10 yang terdampak).
+            'registry.npmjs.org/-/npm/v1/security/advisories/bulk' => Http::response([
+                'lodash' => [
+                    [
+                        'id' => 'GHSA-35jh-r3h4-6jhm',
+                        'title' => 'Prototype pollution in lodash',
+                        'severity' => 'high',
+                        'vulnerable_versions' => '<4.17.19',
+                    ],
+                ],
+            ]),
+        ]);
+
+        // ^4.17.20 = [4.17.20, 5.0.0) tidak beririsan dengan (-inf, 4.17.19)
+        $result = (new NpmChecker)->check(dependencies: ['lodash' => '^4.17.20']);
+        $lodash = $result['packages'][0];
+
+        $this->assertTrue($lodash['checked']);
+        $this->assertFalse($lodash['vulnerable']);
+        $this->assertSame([], $lodash['advisories']);
+    }
+
+    public function test_advisory_intersecting_dependency_range_is_flagged(): void
+    {
+        Http::fake([
+            'registry.npmjs.org/lodash' => Http::response([
+                'versions' => [
+                    '4.17.10' => [],
+                    '4.17.19' => [],
+                    '4.17.20' => [],
+                ],
+            ]),
+            'registry.npmjs.org/-/npm/v1/security/advisories/bulk' => Http::response([
+                'lodash' => [
+                    [
+                        'id' => 'GHSA-35jh-r3h4-6jhm',
+                        'title' => 'Prototype pollution in lodash',
+                        'severity' => 'high',
+                        // [4.17.10, 4.17.20) beririsan dengan ^4.17.10
+                        'vulnerable_versions' => '>=4.17.10 <4.17.20',
+                    ],
+                ],
+            ]),
+        ]);
+
+        $result = (new NpmChecker)->check(dependencies: ['lodash' => '^4.17.10']);
+        $lodash = $result['packages'][0];
+
+        $this->assertTrue($lodash['vulnerable']);
+        $this->assertCount(1, $lodash['advisories']);
+        $this->assertSame('>=4.17.10 <4.17.20', $lodash['advisories'][0]['affected_versions']);
+    }
+
+    public function test_installed_lock_version_is_part_of_dependency_interval(): void
+    {
+        Http::fake([
+            'registry.npmjs.org/lodash' => Http::response([
+                'versions' => ['4.17.21' => [], '5.0.0' => []],
+            ]),
+            'registry.npmjs.org/-/npm/v1/security/advisories/bulk' => Http::response([
+                'lodash' => [
+                    [
+                        'id' => 'GHSA-lock-drift',
+                        'title' => 'Contoh lock file menyimpang',
+                        'severity' => 'moderate',
+                        'vulnerable_versions' => '<5.0.1',
+                    ],
+                ],
+            ]),
+        ]);
+
+        $result = (new NpmChecker)->check(
+            dependencies: ['lodash' => '^4.17.20'],
+            installed: ['lodash' => ['version' => '5.0.0', 'dev' => false]],
+        );
+
+        $lodash = $result['packages'][0];
+
+        $this->assertSame('5.0.0', $lodash['installed_version']);
+        $this->assertTrue($lodash['vulnerable']);
+    }
 }

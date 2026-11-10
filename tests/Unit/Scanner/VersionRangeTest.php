@@ -104,6 +104,64 @@ class VersionRangeTest extends TestCase
         $this->assertFalse($this->intersects('^12.0', '<11.44.1'));
     }
 
+    public function test_npm_overlapping_ranges_intersect(): void
+    {
+        // ^1.2.3 = [1.2.3, 2.0.0) dan >=1.5.0 <1.6.0 = [1.5.0, 1.6.0)
+        $this->assertTrue($this->intersects('^1.2.3', '>=1.5.0 <1.6.0', npm: true));
+        // Irisan juga terdeteksi saat advisory memotong batas atas dependency
+        $this->assertTrue($this->intersects('^1.2.3', '>=1.9.0 <2.1.0', npm: true));
+    }
+
+    public function test_npm_disjoint_ranges_do_not_intersect(): void
+    {
+        // ^1.2.3 = [1.2.3, 2.0.0) vs [2.0.0, 2.1.0)
+        $this->assertFalse($this->intersects('^1.2.3', '>=2.0.0 <2.1.0', npm: true));
+        // ^2.1.0 vs advisory yang hanya menyentuh 2.0.x
+        $this->assertFalse($this->intersects('^2.1.0', '>=2.0.0 <2.1.0', npm: true));
+    }
+
+    public function test_npm_inclusive_lower_and_upper_bounds(): void
+    {
+        // Advisory [1.5.0, 1.9.0] — kedua batas inklusif
+        $this->assertTrue($this->intersects('1.5.0', '>=1.5.0 <=1.9.0', npm: true));
+        $this->assertTrue($this->intersects('1.9.0', '>=1.5.0 <=1.9.0', npm: true));
+        $this->assertFalse($this->intersects('1.9.1', '>=1.5.0 <=1.9.0', npm: true));
+        // Beririsan tepat di titik batas atas 1.9.0
+        $this->assertTrue($this->intersects('>=1.9.0 <2.0.0', '>=1.5.0 <=1.9.0', npm: true));
+    }
+
+    public function test_npm_exclusive_bounds(): void
+    {
+        // >1.5.1 tidak mencakup 1.5.1, sedangkan >=1.5.1 mencakupnya
+        $this->assertFalse($this->intersects('1.5.1', '>1.5.1', npm: true));
+        $this->assertTrue($this->intersects('1.5.1', '>=1.5.1', npm: true));
+        // <1.5.0 tidak mencakup 1.5.0, sedangkan <=1.5.0 mencakupnya
+        $this->assertFalse($this->intersects('1.5.0', '<1.5.0', npm: true));
+        $this->assertTrue($this->intersects('1.5.0', '<=1.5.0', npm: true));
+        // ^1.5.0 = [1.5.0, 2.0.0) — batas atas eksklusif
+        $this->assertFalse($this->intersects('^1.5.0', '>=2.0.0 <3.0.0', npm: true));
+    }
+
+    public function test_npm_caret_and_tilde_ranges(): void
+    {
+        // ^0.2.3 = [0.2.3, 0.3.0)
+        $this->assertTrue($this->intersects('^0.2.3', '>=0.2.5 <0.4.0', npm: true));
+        $this->assertFalse($this->intersects('^0.2.3', '>=0.3.0 <0.4.0', npm: true));
+
+        // ~1.2.3 = [1.2.3, 1.3.0)
+        $this->assertTrue($this->intersects('~1.2.3', '>=1.2.9 <1.4.0', npm: true));
+        $this->assertFalse($this->intersects('~1.2.3', '>=1.3.0 <1.4.0', npm: true));
+    }
+
+    public function test_npm_or_alternatives(): void
+    {
+        // Advisory punya dua alternatif: [1.9.5, 1.9.7) atau [2.0.0, 2.1.0)
+        $this->assertTrue($this->intersects('^1.9.6', '>=1.9.5 <1.9.7 || >=2.0.0 <2.1.0', npm: true));
+        $this->assertTrue($this->intersects('^2.0.5', '>=1.9.5 <1.9.7 || >=2.0.0 <2.1.0', npm: true));
+        // ^1.9.8 = [1.9.8, 2.0.0) tidak menyentuh satu pun alternatif
+        $this->assertFalse($this->intersects('^1.9.8', '<1.8.0 || >=1.9.5 <1.9.7', npm: true));
+    }
+
     private function eq(string $version): Constraint
     {
         $normalized = (new VersionParser)->normalize($version);

@@ -5,6 +5,7 @@ namespace App\Services\Scanner;
 use Composer\Semver\Constraint\Constraint;
 use Composer\Semver\Constraint\ConstraintInterface;
 use Composer\Semver\Constraint\MatchAllConstraint;
+use Composer\Semver\Constraint\MatchNoneConstraint;
 use Composer\Semver\Constraint\MultiConstraint;
 use Composer\Semver\Intervals;
 use Composer\Semver\VersionParser;
@@ -76,6 +77,26 @@ class VersionRange
     }
 
     /**
+     * Gabungkan beberapa interval sebagai alternatif (union / ATAU).
+     * Dipakai mis. untuk menggabungkan constraint manifest dengan versi lock
+     * yang benar-benar terpasang menjadi satu interval dependensi.
+     */
+    public static function anyOf(ConstraintInterface ...$ranges): ConstraintInterface
+    {
+        $ranges = array_values($ranges);
+
+        if ($ranges === []) {
+            return new MatchNoneConstraint;
+        }
+
+        if (count($ranges) === 1) {
+            return $ranges[0];
+        }
+
+        return MultiConstraint::create($ranges, false);
+    }
+
+    /**
      * Apakah range dependency beririsan dengan range advisory.
      * Jika penilaian gagal, hasilnya "true" (fail-safe: lebih baik flag).
      */
@@ -114,7 +135,8 @@ class VersionRange
 
         $constraints = [];
 
-        foreach (preg_split('/\s+/', $part) ?: [] as $token) {
+        // Koma dan spasi sama-sama berarti DAN (mis. ">=2.0,<2.0.34").
+        foreach (preg_split('/[\s,]+/', $part) ?: [] as $token) {
             if ($token === '' || $token === '*') {
                 $constraints[] = new MatchAllConstraint;
 
@@ -142,7 +164,21 @@ class VersionRange
             return self::parser()->parseConstraints($token);
         }
 
-        // Operator perbandingan: >=, >, <=, <, =, != (sudah dinormalisasi tanpa spasi)
+        // Operator perbandingan: >=, >, <=, <, =, != (sudah dinormalisasi tanpa spasi).
+        // Versi sederhana dibangun langsung dari bentuk ternormalisasi agar batas
+        // interval tetap persis. VersionParser menambahkan akhiran "-dev" pada
+        // batas bawah (mis. ">=2.0.0" menjadi ">=2.0.0.0-dev"), dan itu membuat
+        // batas eksklusif seperti "<2.0.0" salah dianggap beririsan.
+        if (preg_match('/^(>=|<=|>|<|!=|==|=)(v?\d+(?:\.\d+){0,3}(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?)$/', $token, $m)) {
+            $operator = $m[1] === '=' ? '==' : $m[1];
+
+            try {
+                return new Constraint($operator, self::parser()->normalize(ltrim($m[2], 'v')));
+            } catch (\UnexpectedValueException) {
+                return self::parser()->parseConstraints($token);
+            }
+        }
+
         if (preg_match('/^(>=|<=|>|<|=|!=|==)/', $token)) {
             return self::parser()->parseConstraints($token);
         }
@@ -176,14 +212,14 @@ class VersionRange
 
         if ($npm) {
             // Semantik npm untuk versi parsial:
-            // "1.2.3" -> >=1.2.3 <1.2.4 (exact)
+            // "1.2.3" -> tepat 1.2.3 (interval titik [1.2.3, 1.2.3])
             // "1.2"   -> >=1.2.0 <1.3.0
             // "1"     -> >=1.0.0 <2.0.0
+            //
+            // Titik (bukan [1.2.3, 1.2.4)) dipakai agar batas eksklusif seperti
+            // ">1.2.3" benar-benar tidak beririsan dengan versi 1.2.3.
             if ($patch !== null) {
-                return self::and(
-                    new Constraint('>=', self::norm("{$major}.{$minor}.{$patch}{$suffix}")),
-                    new Constraint('<', self::norm("{$major}.{$minor}.".(((int) $patch) + 1))),
-                );
+                return new Constraint('==', self::norm("{$major}.{$minor}.{$patch}{$suffix}"));
             }
 
             if ($minor !== null) {

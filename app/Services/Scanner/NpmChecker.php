@@ -3,6 +3,7 @@
 namespace App\Services\Scanner;
 
 use Composer\Semver\Constraint\Constraint;
+use Composer\Semver\Constraint\ConstraintInterface;
 use Composer\Semver\VersionParser;
 use Illuminate\Http\Client\Pool;
 use Illuminate\Support\Facades\Http;
@@ -17,7 +18,18 @@ use Illuminate\Support\Facades\Http;
  *
  * Langkah 2 (advisory): POST https://registry.npmjs.org/-/npm/v1/security/advisories/bulk
  *   Body: JSON top-level map {"paket": ["1.2.3", ...]}
- *   → daftar advisory untuk versi-versi tersebut. Juga gratis, tanpa API key.
+ *   → daftar advisory beserta field vulnerable_versions. Juga gratis, tanpa API key.
+ *
+ * Langkah 3 (pencocokan lokal / Interval Intersection): rentang versi dependensi
+ *   di package.json dan vulnerable_versions dari advisory sama-sama diubah
+ *   menjadi interval lalu diuji irisannya lewat VersionRange::rangeIntersects().
+ *   Respons API tidak dipakai apa adanya: sebuah advisory hanya menandai paket
+ *   rentan bila irisan kedua interval tidak kosong.
+ *
+ * Catatan: Bulk Advisory API menyaring advisory berdasarkan versi yang dikirim.
+ * Karena itu permintaan dilakukan untuk seluruh versi registry yang diketahui
+ * (bukan hanya versi yang cocok constraint), supaya penyaringan API tidak
+ * menjadi penentu keputusan; keputusan tetap dibuat lokal oleh irisan interval.
  */
 class NpmChecker
 {
@@ -25,7 +37,7 @@ class NpmChecker
 
     private const BULK_API_URL = 'https://registry.npmjs.org/-/npm/v1/security/advisories/bulk';
 
-    private const MAX_VERSIONS_PER_PACKAGE = 500;
+    private const MAX_ADVISORY_QUERY_VERSIONS = 1500;
 
     private const REGISTRY_POOL_SIZE = 25;
 
@@ -119,11 +131,17 @@ class NpmChecker
         $needRegistry = array_filter($checkable, fn (array $m) => $m['installed'] === null);
         $registryVersions = $this->fetchRegistryVersions(array_keys($needRegistry), $warnings, $registryErrors);
 
-        $expansions = [];
+        // Interval dependensi (semantik npm) dan daftar versi yang dikirim ke
+        // Bulk Advisory API, per paket.
+        $dependencyRanges = [];
+        $advisoryQueries = [];
 
         foreach ($checkable as $name => $meta) {
+            $dependencyRanges[$name] = self::dependencyRange($meta);
+
+            // Paket dengan versi lock: yang diperiksa adalah versi terpasang.
             if ($meta['installed'] !== null) {
-                $expansions[$name] = [$meta['installed']];
+                $advisoryQueries[$name] = [$meta['installed']];
 
                 continue;
             }
@@ -136,32 +154,25 @@ class NpmChecker
                 continue;
             }
 
-            $versions = self::filterVersions($real, $meta['constraint']);
-
-            if ($versions === []) {
+            if (self::filterVersions($real, $meta['constraint']) === []) {
                 $skipped[$name] = 'tidak ada versi registry yang cocok dengan constraint (atau paket tidak ditemukan)';
 
                 continue;
             }
 
-            if (count($versions) > self::MAX_VERSIONS_PER_PACKAGE) {
-                $warnings[] = "{$name}: terdapat ".count($versions).' versi yang cocok, hanya '.self::MAX_VERSIONS_PER_PACKAGE.' pertama yang dikirim.';
-                $versions = array_slice($versions, 0, self::MAX_VERSIONS_PER_PACKAGE);
-            }
-
-            $expansions[$name] = $versions;
+            $advisoryQueries[$name] = self::advisoryQueryVersions($real, $meta['constraint'], $name, $warnings);
         }
 
         // 3. Kirim ke Bulk Advisory API
         $advisoriesByPackage = [];
         $apiFailed = false;
 
-        if (($expansions ?? []) !== []) {
+        if ($advisoryQueries !== []) {
             try {
                 $response = Http::timeout(60)
                     ->retry(2, 500)
                     ->asJson()
-                    ->post(self::BULK_API_URL, $expansions);
+                    ->post(self::BULK_API_URL, $advisoryQueries);
 
                 if ($response->failed()) {
                     $warnings[] = "npm Bulk Advisory API merespons {$response->status()}.";
@@ -193,9 +204,23 @@ class NpmChecker
             }
 
             $formatted = [];
+            $dependencyRange = $dependencyRanges[$name];
 
             foreach ($advisoriesByPackage[$name] ?? [] as $advisory) {
                 if (! is_array($advisory)) {
+                    continue;
+                }
+
+                $vulnerableRange = self::advisoryRange($advisory);
+
+                if ($vulnerableRange === null) {
+                    // Tanpa rentang versi tidak ada interval yang bisa diiriskan.
+                    continue;
+                }
+
+                // Interval Intersection: advisory hanya relevan bila rentang
+                // terdampaknya beririsan dengan rentang versi dependensi.
+                if (! VersionRange::rangeIntersects($dependencyRange, $vulnerableRange)) {
                     continue;
                 }
 
@@ -273,6 +298,88 @@ class NpmChecker
         unset($row);
 
         return ['packages' => $results, 'warnings' => $warnings];
+    }
+
+    /**
+     * Interval rentang versi dependensi (semantik npm).
+     *
+     * Constraint dari package.json digabung (union) dengan versi pasti dari
+     * lock file bila ada, karena versi itulah yang benar-benar terpasang dan
+     * lock file bisa menyimpang dari constraint manifest. Untuk paket
+     * transitive (hanya ada di lock file), constraint-nya adalah versi tersebut.
+     *
+     * @param  array{constraint: string, installed: ?string}  $meta
+     */
+    private static function dependencyRange(array $meta): ConstraintInterface
+    {
+        $ranges = [VersionRange::parse($meta['constraint'], npm: true)];
+
+        if (is_string($meta['installed']) && $meta['installed'] !== '') {
+            $ranges[] = VersionRange::parse($meta['installed'], npm: true);
+        }
+
+        return VersionRange::anyOf(...$ranges);
+    }
+
+    /**
+     * Interval versi terdampak dari satu advisory Bulk API.
+     * null bila advisory tidak mencantumkan rentang versi sama sekali.
+     */
+    private static function advisoryRange(array $advisory): ?ConstraintInterface
+    {
+        $raw = $advisory['vulnerable_versions'] ?? ($advisory['range'] ?? null);
+
+        if (is_array($raw)) {
+            $raw = implode(' || ', array_filter($raw, 'is_string'));
+        }
+
+        if (! is_string($raw) || trim($raw) === '') {
+            return null;
+        }
+
+        return VersionRange::advisoryRange($raw, npm: true);
+    }
+
+    /**
+     * Daftar versi yang dikirim ke Bulk Advisory API.
+     *
+     * Seluruh versi registry dikirim (bukan hanya yang cocok constraint) agar
+     * penyaringan versi oleh API tidak menjadi penentu: API hanya sumber data,
+     * sedangkan keputusan rentan/tidak dibuat lokal lewat irisan interval.
+     * Bila jumlah versi melebihi batas, dipakai versi yang cocok constraint
+     * (daya deteksi untuk rentang dependensi tetap terjaga) dan pengguna diberi
+     * peringatan bahwa advisory di luar rentang tidak ikut terambil.
+     *
+     * @param  array<int, string>  $versions
+     * @param  array<int, string>  $warnings
+     * @return array<int, string>
+     */
+    private static function advisoryQueryVersions(array $versions, string $constraint, string $name, array &$warnings): array
+    {
+        $valid = array_values(array_filter(
+            $versions,
+            fn ($version) => is_string($version) && preg_match('/^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/', $version) === 1,
+        ));
+
+        usort($valid, 'version_compare');
+
+        if (count($valid) <= self::MAX_ADVISORY_QUERY_VERSIONS) {
+            return $valid;
+        }
+
+        $matched = self::filterVersions($valid, $constraint);
+
+        if ($matched === []) {
+            return array_slice($valid, -self::MAX_ADVISORY_QUERY_VERSIONS);
+        }
+
+        if (count($matched) > self::MAX_ADVISORY_QUERY_VERSIONS) {
+            $warnings[] = "{$name}: terdapat ".count($matched).' versi yang cocok, hanya '.self::MAX_ADVISORY_QUERY_VERSIONS.' pertama yang dikirim.';
+        } else {
+            $warnings[] = "{$name}: ".count($valid).' versi di registry melebihi batas '.self::MAX_ADVISORY_QUERY_VERSIONS.' versi per permintaan; hanya versi yang cocok constraint yang dikirim sehingga advisory di luar rentang constraint tidak terambil.';
+        }
+
+        return array_slice($matched, 0, self::MAX_ADVISORY_QUERY_VERSIONS);
     }
 
     /**
